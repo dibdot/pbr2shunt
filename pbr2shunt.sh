@@ -8,6 +8,8 @@
 # Exit: 0 = everything migrated, 1 = fatal error, 2 = done, but sections or
 #       options were skipped (see report)
 #
+# The result needs shunt 0.2.0 or later (src_dev, port-only policies).
+#
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 Dirk Brenken <dev@brenken.org>
 
@@ -47,8 +49,10 @@ set -f
 rc=0
 names=' '
 pcount=0
+snoop=' '
 tmp="$(mktemp)" || exit 1
-trap 'rm -f "$tmp"' EXIT
+pol="$(mktemp)" || exit 1
+trap 'rm -f "$tmp" "$pol"' EXIT
 trap 'exit 1' INT TERM
 
 warn() {
@@ -78,6 +82,8 @@ is_port() {
 	hi="${hi#${hi%%[!0]*}}"
 	[ "${lo:-0}" -ge 1 ] && [ "${hi:-0}" -le 65535 ] && [ "${lo:-0}" -le "${hi:-0}" ]
 }
+# a kernel device name, the shape shunt accepts for src_dev
+is_dev() { printf '%s' "$1" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$'; }
 is_url() {
 	case "$1" in file://* | ftp://* | http://* | https://*) return 0 ;; esac
 	return 1
@@ -113,7 +119,7 @@ config_get prefixlength config prefixlength '1'
 [ "$resolver" = 'none' ] && resolver=''
 [ "$strict" = '1' ] && fallback='block' || fallback='main'
 
-[ "$ipv6" = '0' ] && note "note: pbr had IPv6 disabled, shunt routes both families - policies selecting by src_mac or domain now steer IPv6 as well; check that their interface carries IPv6"
+[ "$ipv6" = '0' ] && note "note: pbr had IPv6 disabled, shunt routes both families - policies selecting by src_mac, src_dev or domain now steer IPv6 as well; check that their interface carries IPv6"
 [ -n "$icmp_if" ] && warn "skip: global icmp_interface '$icmp_if' has no shunt equivalent"
 [ "$prefixlength" != '0' ] && [ "$prefixlength" != '1' ] && note "note: pbr prefixlength '$prefixlength' differs, shunt keep_local uses suppress_prefixlength 0"
 
@@ -123,23 +129,14 @@ for v in $(/sbin/uci ${UCI_CONFIG_DIR:+-c "$UCI_CONFIG_DIR"} -q show pbr.config 
 	[ "$d" != '0' ] && warn "skip: global $v '$d', DSCP based routing has no shunt equivalent"
 done
 
-{
-	printf 'config global\n'
-	printf "\toption enabled '1'\n"
-	printf "\toption poll_interval '300'\n"
-	printf "\toption entry_ttl '1200'\n"
-	printf "\toption snoop '1'\n"
-	printf "\toption debug '0'\n"
-	printf "\toption rp_filter_manage '0'\n"
-	for d in $(words "$lan_dev"); do
-		printf '\tlist snoop_device %s\n' "$(q "$d")"
-	done
-} >"$tmp"
+for d in $(words "$lan_dev"); do
+	snoop="$snoop$d "
+done
 
 migrate_policy() {
 	local sec="$1" name enabled iface proto chain src_addr src_port dest_addr dest_port
 	local e p skip='' action='route' sname dis=''
-	local src='' mac='' dst='' dom='' ports='' protos=''
+	local src='' mac='' dev='' dst='' dom='' ports='' protos=''
 
 	pcount=$((pcount + 1))
 	config_get name "$sec" name "Untitled"
@@ -171,7 +168,6 @@ migrate_policy() {
 	esac
 
 	[ -z "${src_addr}${src_port}${dest_addr}${dest_port}" ] && _skip "no source or destination selector - pbr rejects it"
-	[ -n "$dest_port" ] && [ -z "${src_addr}${dest_addr}" ] && _skip "ports only - shunt needs a client, address or domain next to dport"
 	[ -n "$src_port" ] && _skip "src_port '$src_port' - shunt has no source port selector"
 
 	case "$src_addr $dest_addr $dest_port" in
@@ -183,7 +179,7 @@ migrate_policy() {
 		if is_url "$e"; then
 			_skip "src_addr URL '$e' - not supported"
 		elif case "$e" in @*) true ;; *) false ;; esac; then
-			_skip "src_addr device '$e' - shunt selects clients by address or MAC only"
+			is_dev "${e#@}" && dev="$dev ${e#@}" || _skip "src_addr device '$e' - not a device name"
 		elif is_mac "$e"; then
 			mac="$mac $(printf '%s' "$e" | tr 'A-F' 'a-f')"
 		elif is_mac_dash "$e"; then
@@ -202,7 +198,7 @@ migrate_policy() {
 		case "$e" in '!'*) continue ;; esac
 		e="${e%.}"
 		if is_url "$e"; then
-			_skip "dest_addr URL '$e' - fetch it outside shunt and use domain_file"
+			_skip "dest_addr URL '$e' - fetch it outside shunt and use dst_file or domain_file"
 		elif case "$e" in @*) true ;; *) false ;; esac; then
 			_skip "dest_addr device '$e' - shunt has no output interface selector"
 		elif is_ipv4 "$e" || is_ipv6 "$e"; then
@@ -237,6 +233,16 @@ migrate_policy() {
 
 	[ -n "$skip" ] && return 0
 
+	# shunt learns domains from the DNS answers it observes, so a device
+	# selected for a domain policy has to be observed as well
+	if [ -n "$dom" ]; then
+		for e in $dev; do
+			case "$snoop" in *" $e "*) continue ;; esac
+			snoop="$snoop$e "
+			note "note: policy '$name': '$e' added to snoop_device for its domains"
+		done
+	fi
+
 	slug "$name"
 	{
 		printf '\nconfig policy %s\n' "$(q "$sname")"
@@ -249,11 +255,12 @@ migrate_policy() {
 		fi
 		for e in $src; do printf '\tlist src %s\n' "$(q "$e")"; done
 		for e in $mac; do printf '\tlist src_mac %s\n' "$(q "$e")"; done
+		for e in $(printf '%s\n' $dev | awk '!s[$0]++'); do printf '\tlist src_dev %s\n' "$(q "$e")"; done
 		for e in $protos; do printf '\tlist proto %s\n' "$(q "$e")"; done
 		for e in $ports; do printf '\tlist dport %s\n' "$(q "$e")"; done
 		for e in $dst; do printf '\tlist dst %s\n' "$(q "$e")"; done
 		for e in $(printf '%s\n' $dom | awk '!s[$0]++'); do printf '\tlist domain %s\n' "$(q "$e")"; done
-	} >>"$tmp"
+	} >>"$pol"
 
 	note "ok:   policy '$name'${dis} -> '$sname'"
 }
@@ -267,6 +274,21 @@ skip_section() {
 config_foreach migrate_policy policy
 config_foreach skip_section dns_policy 'dns_policy' 1
 config_foreach skip_section include 'include (user file)' 0
+
+# written last, a policy may have added a device to observe
+{
+	printf 'config global\n'
+	printf "\toption enabled '1'\n"
+	printf "\toption poll_interval '300'\n"
+	printf "\toption entry_ttl '1200'\n"
+	printf "\toption snoop '1'\n"
+	printf "\toption debug '0'\n"
+	printf "\toption rp_filter_manage '0'\n"
+	for d in $snoop; do
+		printf '\tlist snoop_device %s\n' "$(q "$d")"
+	done
+	cat "$pol"
+} >"$tmp"
 
 if [ -n "$out" ]; then
 	cp "$tmp" "$out" || exit 1
